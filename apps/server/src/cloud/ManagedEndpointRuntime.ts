@@ -1,4 +1,5 @@
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -7,14 +8,18 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 
 export type CloudManagedEndpointRuntimeStatus =
   | {
@@ -84,6 +89,25 @@ const CONNECTOR_REGISTRATION_TIMEOUT = Duration.minutes(3);
 // than this, so a crash-looping connector or an offline host does not redownload
 // on every reconcile.
 const RELAY_CLIENT_INSTALL_RETRY_INTERVAL_MS = 10 * 60_000;
+const RELAY_CLIENT_ARGS = [
+  "tunnel",
+  "--no-autoupdate",
+  "--loglevel",
+  "info",
+  "--output",
+  "default",
+  "run",
+];
+// The connector shares the server's process group and stops only when its scope
+// closes. A server that dies without running finalizers (a crash, SIGKILL, or a
+// launcher's kill deadline) leaves it running under init with a live tunnel
+// connection. Each spawn is recorded so the next server can stop that orphan.
+const RELAY_CLIENT_PROCESS_SECRET = "cloud-relay-client-process";
+const RelayClientProcessRecord = Schema.fromJsonString(
+  Schema.Struct({ pid: Schema.Number, parentPid: Schema.Number, command: Schema.String }),
+);
+const decodeRelayClientProcessRecord = Schema.decodeUnknownOption(RelayClientProcessRecord);
+const encodeRelayClientProcessRecord = Schema.encodeEffect(RelayClientProcessRecord);
 
 /**
  * A linked host converges on the pinned managed release when it has no relay
@@ -162,6 +186,7 @@ const stopConnector = (connector: ActiveConnector | null) =>
 export const make = Effect.gen(function* () {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const relayClient = yield* RelayClient.RelayClient;
+  const secrets = yield* ServerSecretStore.ServerSecretStore;
   const activeRef = yield* Ref.make<ActiveConnector | null>(null);
   const desiredConfigRef = yield* Ref.make<RelayManagedEndpointRuntimeConfig | null>(null);
   const recoveryRequests = yield* Queue.sliding<RelayManagedEndpointRuntimeConfig>(1);
@@ -375,6 +400,48 @@ export const make = Effect.gen(function* () {
     yield* Effect.forkIn(retryPinnedRelayClientInstall, runtimeScope);
   });
 
+  // Stops the recorded connector if it outlived the server that started it. It
+  // must still run the recorded command and no longer be that server's child,
+  // so a reused PID or a connector of another live server is left alone.
+  // SIGKILL because cloudflared drains for 30 s on SIGTERM.
+  const stopOrphanedConnector = Effect.gen(function* () {
+    if (yield* HostProcess.isWindows) return;
+    const stored = yield* secrets.get(RELAY_CLIENT_PROCESS_SECRET);
+    if (Option.isNone(stored)) return;
+    const record = decodeRelayClientProcessRecord(new TextDecoder().decode(stored.value));
+    if (Option.isNone(record)) return;
+    const { pid, parentPid, command } = record.value;
+    const output = yield* spawner.string(
+      ChildProcess.make("ps", ["-ww", "-o", "ppid=,command=", "-p", String(pid)], {
+        stdin: "ignore",
+        stderr: "ignore",
+      }),
+    );
+    const match = /^\s*(\d+)\s+(.+?)\s*$/u.exec(output);
+    if (!match || Number(match[1]) === parentPid || match[2] !== command) return;
+    yield* Effect.try(() => process.kill(pid, "SIGKILL"));
+    yield* Effect.logWarning("Stopped a relay client left running by a previous server", {
+      pid,
+      parentPid,
+    });
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Effect.logDebug("Could not check for an orphaned relay client", { cause }),
+    ),
+  );
+
+  const recordConnector = (pid: number, executablePath: string) =>
+    encodeRelayClientProcessRecord({
+      pid,
+      parentPid: process.pid,
+      command: [executablePath, ...RELAY_CLIENT_ARGS].join(" "),
+    }).pipe(
+      Effect.flatMap((json) =>
+        secrets.set(RELAY_CLIENT_PROCESS_SECRET, new TextEncoder().encode(json)),
+      ),
+      Effect.catchCause((cause) => Effect.logDebug("Could not record the relay client", { cause })),
+    );
+
   // Requests recovery while the connector has not registered a connection,
   // once per timeout, until it connects or is replaced.
   const watchConnectorRegistration = (connector: ActiveConnector) =>
@@ -502,23 +569,20 @@ export const make = Effect.gen(function* () {
       } satisfies CloudManagedEndpointRuntimeStatus;
     }
 
+    yield* stopOrphanedConnector;
     const connectorScope = yield* Scope.make("sequential");
     const child = yield* spawner
       .spawn(
-        ChildProcess.make(
-          executable.executablePath,
-          ["tunnel", "--no-autoupdate", "--loglevel", "info", "--output", "default", "run"],
-          {
-            detached: false,
-            env: {
-              ...process.env,
-              TUNNEL_TOKEN: config.connectorToken,
-            },
-            shell: false,
-            stderr: "pipe",
-            stdout: "pipe",
+        ChildProcess.make(executable.executablePath, RELAY_CLIENT_ARGS, {
+          detached: false,
+          env: {
+            ...process.env,
+            TUNNEL_TOKEN: config.connectorToken,
           },
-        ),
+          shell: false,
+          stderr: "pipe",
+          stdout: "pipe",
+        }),
       )
       .pipe(
         Effect.provideService(Scope.Scope, connectorScope),
@@ -565,6 +629,7 @@ export const make = Effect.gen(function* () {
         registered: yield* Deferred.make<void>(),
       } satisfies ActiveConnector;
       yield* Ref.set(activeRef, connector);
+      yield* recordConnector(Number(child.pid), executable.executablePath);
       yield* Effect.forkIn(observeConnectorOutput(connector), connectorScope);
       yield* Effect.forkIn(superviseConnector(connector), connectorScope);
       yield* Effect.forkIn(watchConnectorRegistration(connector), connectorScope);
